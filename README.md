@@ -8,8 +8,9 @@ The domain controller is [Samba](https://www.samba.org/) in AD DC mode. To a Win
 client it is an Active Directory domain: same Kerberos, same LDAP, same Group Policy,
 same `net use`, same domain join.
 
-> **Not tested yet.** The code is written and statically checked; nothing here has been
-> built or deployed. See [Verified status](#verified-status).
+> Verified end to end on real infrastructure: two domain controllers deployed from
+> MAAS, replicating, with a Windows Server 2025 machine joined to the domain. See
+> [Verified status](#verified-status) for exactly what was and was not tested.
 
 ---
 
@@ -18,6 +19,7 @@ same `net use`, same domain join.
 - [If Active Directory is new to you](#if-active-directory-is-new-to-you)
 - [What "highly available" means here](#what-highly-available-means-here)
 - [The SYSVOL problem](#the-sysvol-problem)
+- [What Samba does not do](#what-samba-does-not-do)
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
@@ -130,6 +132,27 @@ This is a real limitation of Samba, not of this image. If you need genuine multi
 SYSVOL replication, you need Windows DCs.
 
 ---
+
+## What Samba does not do
+
+Two gaps matter in practice. Both are Samba's, not this image's.
+
+**No ADWS.** Samba does not implement Active Directory Web Services (TCP 9389), so the
+PowerShell `ActiveDirectory` module — `Get-ADUser`, `Get-ADDomain`, `Get-ADDomainController`
+— **does not work** against a Samba DC. It fails with "Unable to find a default server
+with Active Directory Web Services running."
+
+What does work is everything built on LDAP and RPC, which is most of it:
+
+- **ADUC**, ADSI Edit and the rest of the MMC snap-ins
+- Raw LDAP from PowerShell (`DirectoryServices.DirectoryEntry`), `dsquery`, `net`
+- `samba-tool` on the DCs themselves
+
+So you manage the domain with the graphical tools or with LDAP, not with the AD
+PowerShell cmdlets. Third-party ADWS implementations for Samba exist; none is shipped
+here.
+
+**No DFS-R for SYSVOL.** Covered in [The SYSVOL problem](#the-sysvol-problem).
 
 ## How it works
 
@@ -346,13 +369,22 @@ These are the same class of problem as in the sibling
    definition takes the real interface down before any automation runs. It ships
    disabled, and MAAS owns the network.
 
+One was found by testing rather than reading:
+
+5. **A sync service that killed itself.** `adc-sysvol-sync.service` originally declared
+   `Requires=samba-ad-dc.service`. The sync restarts `samba-ad-dc` after copying
+   `idmap.ldb`, and systemd stops units that *require* a service being restarted — so the
+   sync died mid-run with SIGTERM. The timer restarted it and it succeeded, so the
+   outcome looked fine while the mechanism was broken. It is `Wants=` now, and the
+   restart is `--no-block`.
+
 Two more are specific to this image:
 
-5. **The cloud kernel.** The Debian cloud image ships `linux-image-cloud-amd64`, built
+6. **The cloud kernel.** The Debian cloud image ships `linux-image-cloud-amd64`, built
    for virtual machines and missing most physical-hardware drivers. A bare-metal DC
    deployed with it can come up with no disk or no network. The build swaps in the
    generic kernel.
-6. **A domain baked into the image.** Installing the packages leaves a default
+7. **A domain baked into the image.** Installing the packages leaves a default
    `smb.conf`. If that shipped, every machine from the image would start from the same
    half-configured directory and `samba-tool domain provision` would refuse to run. The
    build deletes all of it.
@@ -361,30 +393,59 @@ Two more are specific to this image:
 
 ## Verified status
 
-**Nothing in this repository has been built or deployed.** It is written and statically
-checked, no more than that.
+Tested end to end on real infrastructure. Be sceptical of anything not listed under
+**Verified**.
 
-### Checked
+### Test environment
 
 | | |
 |---|---|
-| Shell syntax | `make lint` passes on every script |
-| Generation | `make preseed` and `make customize` produce correct output; the embedded overlay round-trips |
-| Samba capability | Debian trixie ships samba 4.22.10, and `samba-ad-dc` does **not** depend on `krb5-kdc` — so it uses the bundled Heimdal KDC, which is Samba's supported configuration for an AD DC. The build asserts this and fails if it ever changes |
-| SYSVOL behaviour | Confirmed against the Samba wiki: no DFS-R, no FRS, rsync plus `ntacl sysvolreset` is the documented workaround, and `idmap.ldb` must be synced first |
-| Pattern | The build pipeline, curtin hooks and first-boot state machine are adapted from [maas-proxmox](https://github.com/ilkermanap/maas-proxmox), where they were verified end to end on real infrastructure |
+| MAAS | 3.7.2 (snap), isolated subnet, MAAS as gateway and DHCP |
+| DCs | 2 x (2 vCPU, 6 GB, 32 GiB, UEFI), deployed from this image |
+| Windows client | Windows Server 2025 Standard Evaluation, unattended install |
+| Realm | `AD.MAASTEST.LAN` / NetBIOS `MAASTEST`, functional level 2008 R2 |
+| Image | samba 4.22.10, Debian 13, kernel 6.12.107 |
+
+### Verified
+
+| Area | Evidence |
+|---|---|
+| Build | 28/28 checks in `make verify`; 412 MB image |
+| Release pipeline | Published to a release, downloaded anonymously, SHA-256 matched, uploaded to MAAS |
+| Deployment | Both DCs reach `Deployed` from `custom/samba-ad-dc` |
+| **Provisioning** | First DC created the domain in 21 s, unattended, first attempt |
+| **Joining** | Second DC joined in 23 s, first attempt |
+| Kerberos | The built-in self-test obtained a ticket for `Administrator@AD.MAASTEST.LAN` on both DCs |
+| Replication | `samba-tool drs showrepl`: outbound neighbours, last attempt successful, 0 consecutive failures |
+| FSMO | All five roles on the first DC, as expected |
+| **SYSVOL replication** | A file written on DC1 appeared on DC2 within one timer interval; log shows the `idmap.ldb` sync, the rsync and `ntacl sysvolreset` |
+| Credential scrubbing | `AD_ADMIN_PASSWORD` removed from `conf.d` after provisioning on both DCs |
+| SMB shares | `sysvol` and `netlogon` served; contents readable with domain credentials |
+| **Windows DC discovery** | `_ldap._tcp.dc._msdcs.ad.maastest.lan` resolved to `maas-node8:389` |
+| **Windows domain join** | `Add-Computer` succeeded; after reboot `PartOfDomain=True`, `Test-ComputerSecureChannel=True` |
+| DC capability flags | `nltest /dsgetdc` reports `PDC GC DS LDAP KDC TIMESERV GTIMESERV WRITABLE DNS_DC DNS_DOMAIN DNS_FOREST FULL_SECRET` |
+| **Group Policy** | `gpupdate /force /target:computer` completed successfully; `gpresult` shows the domain and site |
+| SYSVOL from Windows | Readable over UNC with domain credentials, including the replicated test file |
+| LDAP from Windows | `DirectoryServices.DirectoryEntry` listed both DCs and the Windows machine account, and the domain users |
 
 ### Not verified
 
-Everything else. Specifically: the image has never been built; no domain has been
-provisioned or joined; SYSVOL replication has never run; the self-test has never
-executed; `BIND9_DLZ` was not tried; no Windows client has been joined to a domain from
-this image; arm64 is untouched.
+- **Windows client OS** (10/11) joining — only Windows Server 2025 was tested
+- Applying an actual **Group Policy object** and observing its effect; only the GPO refresh mechanism was exercised
+- **Interactive** domain logon at the Windows console, and ADUC's GUI. LDAP was proven with explicit credentials, which is the path ADUC uses, but the MMC snap-in itself was not opened
+- Losing a DC and **seizing FSMO roles**
+- More than two DCs, and concurrent joins
+- `BIND9_DLZ` — only `SAMBA_INTERNAL` DNS was used
+- `AD_SYSVOL_SYNC` without an SSH key, i.e. the refuse-and-explain path
+- Real **bare metal** — both DCs were virtual machines
+- **arm64**
+- Domain **trusts**, and interop with a Windows DC in the same forest
 
-Treat the first deployment as a test, and read `journalctl -u adc-maas-init -b` on the
-node.
+### Known not to work
 
----
+- **ADWS**: port 9389 is closed, confirmed from the Windows client. The PowerShell
+  `ActiveDirectory` module cannot be used. See
+  [What Samba does not do](#what-samba-does-not-do).
 
 ## Licensing
 

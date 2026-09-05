@@ -4,7 +4,11 @@
 Description=Replicate SYSVOL from another domain controller
 Documentation=https://wiki.samba.org/index.php/SysVol_replication_(DFS-R)
 After=samba-ad-dc.service
-Requires=samba-ad-dc.service
+# Wants=, deliberately not Requires=. The sync restarts samba-ad-dc after it
+# copies idmap.ldb, and a Requires= dependency makes systemd stop this unit when
+# the thing it requires restarts - so the sync killed itself mid-run with
+# SIGTERM. Ordering is all that is wanted here; the script checks for SYSVOL.
+Wants=samba-ad-dc.service
 ConditionPathExists=/etc/adc-maas/sysvol-sync.conf
 
 [Service]

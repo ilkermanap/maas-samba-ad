@@ -49,7 +49,9 @@ if [ ! -e /var/lib/adc-maas/idmap-synced ]; then
             "root@${SYSVOL_SOURCE}:/var/lib/samba/private/idmap.ldb" \
             /var/lib/samba/private/idmap.ldb; then
         mkdir -p /var/lib/adc-maas && date -Is > /var/lib/adc-maas/idmap-synced
-        systemctl restart samba-ad-dc >/dev/null 2>&1 || true
+        # --no-block so this script is not waiting on a restart of a service
+        # it is ordered after; see the note in adc-sysvol-sync.service.
+        systemctl restart --no-block samba-ad-dc >/dev/null 2>&1 || true
     else
         warn "idmap.ldb sync failed; uid/gid mappings may differ between DCs"
     fi
