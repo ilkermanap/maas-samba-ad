@@ -1,0 +1,10 @@
+# GitHub Pages (Jekyll). index.md includes README.md so the site and the
+# repository documentation cannot drift apart.
+title: maas-samba-ad
+description: >-
+  MAAS-deployable Debian image that becomes a Samba Active Directory domain
+  controller: provisions a new domain or joins an existing one on first boot.
+theme: jekyll-theme-cayman
+show_downloads: false
+exclude:
+  - build/
