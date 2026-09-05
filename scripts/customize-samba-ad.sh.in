@@ -63,6 +63,19 @@ hostname -f || echo "WARNING: hostname -f does not resolve" >&2
 log "holding the cloud-init package"
 apt-mark hold cloud-init || true
 
+# If a caching proxy is configured, rewrite the repositories from https to
+# plain http: a cache cannot see inside a CONNECT tunnel, so https requests are
+# passed through uncached. Package signatures are still verified, so this costs
+# nothing in integrity. Debian 13 keeps the real mirror URLs in
+# /etc/apt/mirrors/*.list behind the "mirror+file:" method, so rewriting
+# sources.list alone would miss them.
+if [ -n "${http_proxy:-}" ]; then
+    log "APT cache in use (${http_proxy}); switching repositories to http"
+    sed -i 's|https://|http://|g' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources \
+        /etc/apt/sources.list.d/*.list /etc/apt/mirrors/*.list 2>/dev/null || true
+fi
+
 apt-get update
 $APT install eatmydata || true
 use_eatmydata

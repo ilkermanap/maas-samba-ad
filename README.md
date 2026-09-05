@@ -341,10 +341,59 @@ their DNS points at a DC.
 | `ARCH` / `BOOT` | `amd64` / `uefi` | Architecture and boot mode |
 | `DISK_SIZE` | `16G` | Build VM disk; upstream's 4G is too small |
 | `PM_REF` | pinned SHA | `canonical/packer-maas` revision |
-| `APT_PROXY` | *(empty)* | Local APT cache — see `make deps-cache` |
+| `APT_PROXY` | *(empty)* | Local APT cache, e.g. `http://10.0.2.2:3142` — see `make deps-cache` |
 
 `make check-upstream` compares the `samba` version in Debian against the image you have,
 without building anything.
+
+### Build performance
+
+A full build takes about **4m40s** on a 4 vCPU / 4 GB build VM. Where that time goes was
+measured rather than guessed, and the result is not what it looked like.
+
+The obvious suspect was slow repository access: inside the build VM apt reported
+600-900 kB/s, while the build host itself pulled from `deb.debian.org` at 48 MB/s. But
+the pattern gave it away — every fetch over roughly 15 MB took *exactly* 31 seconds no
+matter how big it was, while a 14.1 MB fetch took 1 second at 23 MB/s. That is a
+connection timeout, not a bandwidth limit. QEMU's user-mode network offers IPv6 that does
+not actually work, so apt's parallel connections black-holed on it and only fell back to
+IPv4 after 30 seconds.
+
+The Makefile now patches the build VM's cloud-init seed to write
+`Acquire::ForceIPv4 "true"` from `bootcmd`, which runs before SSH is up and therefore
+covers upstream's own apt calls as well as ours. The same 28.5 MB fetch, across three
+builds:
+
+| Build | Setup | Time | Rate |
+|---|---|---|---|
+| 1 | no cache, no patch | 31 s | 914 kB/s |
+| 2 | apt-cacher-ng, no patch | 31 s | 916 kB/s |
+| 3 | apt-cacher-ng + `ForceIPv4` | **3 s** | **9152 kB/s** |
+
+That fetch goes over `https`, which a cache passes through a `CONNECT` tunnel without
+storing, so build 2 isolates the cache from the patch: the cache changed nothing, the
+one-line apt setting was worth 28 seconds.
+
+A local APT cache is still supported and does help on repeat builds, just far less than
+you would expect:
+
+```bash
+sudo make deps-cache                              # installs apt-cacher-ng
+sudo make image APT_PROXY=http://10.0.2.2:3142
+```
+
+With a fully warm cache the 26.2 MB Samba fetch went from 2s to 0s (59 MB/s) and the
+17.9 MB fetch from 1s to 0s — **about three seconds off a 4m40s build**. The rest of the
+time is qemu, dpkg and image compression, none of which a faster mirror touches. A full
+Debian trixie amd64 mirror costs about 138 GB; the cache that produced these numbers is
+44 MB. Mirror the archive if you want it for other reasons, but not to speed these builds
+up.
+
+`10.0.2.2` is the build host as seen from Packer's user-mode network. When a proxy is
+configured, repositories are rewritten from `https` to `http` so the cache can serve
+them; package signatures are still verified. Debian 13 keeps the real mirror URLs in
+`/etc/apt/mirrors/*.list` behind the `mirror+file:` method, so rewriting `sources.list`
+alone is not enough.
 
 ---
 
@@ -411,6 +460,7 @@ Tested end to end on real infrastructure. Be sceptical of anything not listed un
 | Area | Evidence |
 |---|---|
 | Build | 28/28 checks in `make verify`; 412 MB image |
+| Build speed | Four builds measured; `ForceIPv4` took the 28.5 MB fetch from 31 s to 3 s, a warm APT cache saved a further ~3 s of 4m40s |
 | Release pipeline | Published to a release, downloaded anonymously, SHA-256 matched, uploaded to MAAS |
 | Deployment | Both DCs reach `Deployed` from `custom/samba-ad-dc` |
 | **Provisioning** | First DC created the domain in 21 s, unattended, first attempt |
