@@ -1,0 +1,117 @@
+# Copyright (C) 2026 Ilker Manap
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Builds the MAAS image and publishes it as a Gitea release.
+#
+# Runs daily, but only *builds* when Debian actually carries a newer samba or
+# kernel than the last published release, or once the newest image passes
+# MAX_AGE_DAYS. An unconditional daily build would produce a pile of
+# near-identical multi-gigabyte artifacts for nothing. Trigger manually with
+# `force` to rebuild anyway.
+#
+# The runner is registered in host mode: steps run directly on the build machine
+# as root, because the build needs /dev/kvm, qemu-nbd, FUSE and root privileges.
+# Anything that can dispatch a workflow here therefore has root on that machine.
+
+name: build-image
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build even if the version has not changed'
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: maas-builder
+    timeout-minutes: 120
+
+    env:
+      GITEA_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+      GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+      KEEP_RELEASES: '3'
+      # Rebuild even without a Proxmox version change once an image reaches this
+      # age, so Debian base security updates make it into the image.
+      MAX_AGE_DAYS: '30'
+
+    steps:
+      - name: Check out
+        # A plain clone rather than actions/checkout: the runner is in host mode
+        # and has no Node.js runtime for JavaScript actions.
+        run: |
+          set -eux
+          # Step out of the workspace before removing it: the shell starts *in*
+          # $GITHUB_WORKSPACE, and deleting the current working directory makes
+          # every later command fail with "Unable to read current working directory".
+          cd /
+          rm -rf "$GITHUB_WORKSPACE"
+          git clone --depth 1 --branch "$GITHUB_REF_NAME" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE" && git log --oneline -1
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          ./scripts/ci/decide-build.sh "$MAX_AGE_DAYS" > "$GITHUB_OUTPUT"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "forced by manual trigger"
+            sed -i 's/^build=no$/build=yes/' "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
+      - name: Build
+        if: steps.decide.outputs.build == 'yes'
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE"
+          make image
+
+      - name: Verify
+        if: steps.decide.outputs.build == 'yes'
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE"
+          make verify
+
+      - name: Assemble release artifacts
+        if: steps.decide.outputs.build == 'yes'
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          ./scripts/ci/assemble-artifacts.sh "${{ steps.decide.outputs.version }}"
+
+      - name: Publish
+        if: steps.decide.outputs.build == 'yes'
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          ./scripts/ci/publish-release.sh \
+            "${{ steps.decide.outputs.tag }}" \
+            "${{ steps.decide.outputs.version }}" \
+            dist
+
+      - name: Prune old releases
+        if: steps.decide.outputs.build == 'yes'
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          ./scripts/ci/prune-releases.sh "$KEEP_RELEASES"
+
+      - name: Clean up
+        if: always()
+        run: |
+          # A 1.5 GB artifact per run would fill the builder otherwise.
+          # Runs even when an earlier step left the workspace missing, so cd out first.
+          cd /
+          rm -rf "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/build" || true
+          df -h / | tail -1

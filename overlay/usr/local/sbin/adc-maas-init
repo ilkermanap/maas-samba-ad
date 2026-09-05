@@ -1,0 +1,491 @@
+#!/bin/bash
+# Copyright (C) 2026 Ilker Manap
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# adc-maas-init - configures a MAAS-deployed Debian node as a Samba Active
+# Directory domain controller on first boot.
+#
+# Stages, each run once and recorded in /var/lib/adc-maas/<stage>.done:
+#
+#   hosts     the FQDN must resolve to the management address; Samba insists
+#   identity  regenerate anything that must not be shared between clones
+#   time      Kerberos rejects a clock skew over 5 minutes, so chrony first
+#   resolver  a DC has to resolve its own domain
+#   domain    provision a new domain, or join an existing one
+#   services  hand SMB over to the samba-ad-dc daemon
+#   sysvol    set up SYSVOL replication, which Samba does not do by itself
+#   selftest  prove Kerberos and SMB actually answer
+#
+# Configuration comes from /etc/adc-maas/adc-maas.conf and, overriding it,
+# /etc/adc-maas/conf.d/*.conf — which cloud-init writes from the user-data MAAS
+# passes at deploy time.
+#
+set -uo pipefail
+
+CONF_DIR=/etc/adc-maas
+STATE_DIR=/var/lib/adc-maas
+LOG_TAG=adc-maas-init
+
+mkdir -p "$STATE_DIR" "$CONF_DIR/conf.d"
+
+log()  { echo "[$LOG_TAG] $*"; logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true; }
+warn() { echo "[$LOG_TAG] UYARI: $*" >&2; logger -t "$LOG_TAG" -p user.warning -- "WARN: $*" 2>/dev/null || true; }
+
+done_flag() { echo "$STATE_DIR/$1.done"; }
+is_done()   { [ -e "$(done_flag "$1")" ]; }
+mark_done() { date -Is > "$(done_flag "$1")"; }
+
+# ---------------------------------------------------------------------------
+load_config() {
+    # shellcheck disable=SC1091
+    [ -r "$CONF_DIR/adc-maas.conf" ] && . "$CONF_DIR/adc-maas.conf"
+    local f
+    for f in "$CONF_DIR"/conf.d/*.conf; do
+        [ -r "$f" ] || continue
+        log "loading configuration: $f"
+        # shellcheck disable=SC1090
+        . "$f"
+    done
+
+    AD_ENABLED="${AD_ENABLED:-true}"
+    AD_MODE="${AD_MODE:-none}"                 # none | provision | join
+    AD_REALM="${AD_REALM:-}"                   # EXAMPLE.LAN  (uppercase)
+    AD_DOMAIN="${AD_DOMAIN:-}"                 # EXAMPLE      (NetBIOS, <= 15 chars)
+    AD_ADMIN_PASSWORD="${AD_ADMIN_PASSWORD:-}"
+    AD_ADMIN_PASSWORD_FILE="${AD_ADMIN_PASSWORD_FILE:-}"
+    AD_JOIN_USER="${AD_JOIN_USER:-Administrator}"
+    AD_JOIN_PEER="${AD_JOIN_PEER:-}"           # an existing DC; empty = find via DNS
+    AD_DNS_BACKEND="${AD_DNS_BACKEND:-SAMBA_INTERNAL}"
+    AD_DNS_FORWARDER="${AD_DNS_FORWARDER:-}"
+    AD_FUNCTION_LEVEL="${AD_FUNCTION_LEVEL:-2008_R2}"
+    AD_SITE="${AD_SITE:-Default-First-Site-Name}"
+    AD_USE_RFC2307="${AD_USE_RFC2307:-true}"
+    AD_INTERFACE="${AD_INTERFACE:-}"           # empty = the default-route interface
+    AD_NTP_ALLOW="${AD_NTP_ALLOW:-}"           # subnet allowed to use this DC as a time source
+    AD_WAIT="${AD_WAIT:-900}"
+    AD_RETRIES="${AD_RETRIES:-5}"
+    AD_WIPE_SECRETS="${AD_WIPE_SECRETS:-true}"
+
+    AD_SYSVOL_SYNC="${AD_SYSVOL_SYNC:-auto}"   # auto | off | on
+    AD_SYSVOL_SOURCE="${AD_SYSVOL_SOURCE:-}"   # DC to pull SYSVOL from; default = join peer
+    AD_SYSVOL_INTERVAL="${AD_SYSVOL_INTERVAL:-5min}"
+}
+
+admin_password() {
+    if [ -n "$AD_ADMIN_PASSWORD_FILE" ] && [ -r "$AD_ADMIN_PASSWORD_FILE" ]; then
+        head -1 "$AD_ADMIN_PASSWORD_FILE"
+    else
+        printf '%s' "$AD_ADMIN_PASSWORD"
+    fi
+}
+
+primary_iface() {
+    [ -n "$AD_INTERFACE" ] && { echo "$AD_INTERFACE"; return; }
+    ip -4 -o route show default 2>/dev/null \
+      | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+primary_ip() {
+    ip -4 -o route get 1.1.1.1 2>/dev/null \
+      | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+wait_for_network() {
+    local i
+    for ((i = 0; i < 120; i += 5)); do
+        [ -n "$(primary_ip)" ] && return 0
+        sleep 5
+    done
+    return 1
+}
+
+wait_for_cloud_init() {
+    command -v cloud-init >/dev/null 2>&1 || return 0
+    log "waiting for cloud-init"
+    # The unit deliberately carries no cloud-init ordering — see the unit file.
+    timeout 900 cloud-init status --wait >/dev/null 2>&1
+    log "cloud-init: $(cloud-init status 2>/dev/null | head -1)"
+    return 0
+}
+
+realm_lower() { printf '%s' "${AD_REALM,,}"; }
+
+# ---------------------------------------------------------------------------
+# hosts
+# ---------------------------------------------------------------------------
+stage_hosts() {
+    is_done hosts && return 0
+    local host fqdn ip keep
+    host="$(hostname -s)"
+    ip="$(primary_ip)"
+    [ -n "$ip" ] || { warn "no management address found"; return 1; }
+
+    if [ -n "$AD_REALM" ]; then
+        fqdn="${host}.$(realm_lower)"
+    else
+        fqdn="$(hostname -f 2>/dev/null || echo "$host")"
+    fi
+
+    log "/etc/hosts: ${ip} ${fqdn} ${host}"
+    cp -a /etc/hosts "$STATE_DIR/hosts.orig" 2>/dev/null || true
+    keep="$(grep -vE "^[[:space:]]*(127\.0\.0\.1|127\.0\.1\.1|::1|ff02::[12])[[:space:]]" /etc/hosts 2>/dev/null \
+            | grep -vE "[[:space:]]${host}([[:space:]]|\$)" || true)"
+    {
+        echo "127.0.0.1 localhost.localdomain localhost"
+        echo "${ip} ${fqdn} ${host}"
+        [ -n "$keep" ] && echo "$keep"
+        echo
+        echo "::1     localhost ip6-localhost ip6-loopback"
+        echo "ff02::1 ip6-allnodes"
+        echo "ff02::2 ip6-allrouters"
+    } > /etc/hosts
+
+    # cloud-init rewrites /etc/hosts on every boot otherwise, undoing this.
+    cat > /etc/cloud/cloud.cfg.d/99-adc-maas-hosts.cfg <<'EOF'
+# /etc/hosts is managed by adc-maas-init.
+manage_etc_hosts: false
+EOF
+    mark_done hosts
+}
+
+# ---------------------------------------------------------------------------
+# identity — nothing here may be shared between machines built from one image
+# ---------------------------------------------------------------------------
+stage_identity() {
+    is_done identity && return 0
+    if [ ! -s /etc/iscsi/initiatorname.iscsi ] && command -v iscsi-iname >/dev/null 2>&1; then
+        mkdir -p /etc/iscsi
+        echo "InitiatorName=$(iscsi-iname)" > /etc/iscsi/initiatorname.iscsi
+        chmod 0600 /etc/iscsi/initiatorname.iscsi
+    fi
+    mark_done identity
+}
+
+# ---------------------------------------------------------------------------
+# time — Kerberos refuses tickets when the clock is more than five minutes out
+# ---------------------------------------------------------------------------
+stage_time() {
+    is_done time && return 0
+    command -v chronyd >/dev/null 2>&1 || { warn "chrony missing"; mark_done time; return 0; }
+
+    log "configuring chrony (Kerberos requires clock skew under 5 minutes)"
+    # ntpsigndsocket lets Windows clients use this DC as a signed NTP source,
+    # which is what domain members expect.
+    cat > /etc/chrony/conf.d/adc-maas.conf <<EOF
+# Managed by adc-maas-init.
+ntpsigndsocket /var/lib/samba/ntp_signd
+EOF
+    if [ -n "$AD_NTP_ALLOW" ]; then
+        echo "allow ${AD_NTP_ALLOW}" >> /etc/chrony/conf.d/adc-maas.conf
+    else
+        warn "AD_NTP_ALLOW unset — domain members cannot use this DC as a time source"
+    fi
+    systemctl restart chrony >/dev/null 2>&1 || systemctl restart chronyd >/dev/null 2>&1 || true
+    mark_done time
+}
+
+# ---------------------------------------------------------------------------
+# resolver
+# ---------------------------------------------------------------------------
+write_resolv() {
+    local ns="$1" search="$2"
+    [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+    {
+        [ -n "$search" ] && echo "search ${search}"
+        echo "nameserver ${ns}"
+    } > /etc/resolv.conf
+    # Otherwise cloud-init or netplan puts the old resolver back on next boot.
+    cat > /etc/cloud/cloud.cfg.d/99-adc-maas-resolv.cfg <<'EOF'
+manage_resolv_conf: false
+EOF
+}
+
+stage_resolver() {
+    is_done resolver && return 0
+    [ -n "$AD_REALM" ] || { mark_done resolver; return 0; }
+
+    # Before the domain exists locally, point at whichever DC we are joining.
+    # stage_domain switches this to 127.0.0.1 once Samba serves DNS here.
+    local ns
+    if [ "$AD_MODE" = "join" ] && [ -n "$AD_JOIN_PEER" ]; then
+        ns="$AD_JOIN_PEER"
+        log "resolver -> ${ns} (the DC being joined)"
+    else
+        ns="$(primary_ip)"
+        log "resolver -> ${ns} (this host)"
+    fi
+    cp -a /etc/resolv.conf "$STATE_DIR/resolv.conf.orig" 2>/dev/null || true
+    write_resolv "$ns" "$(realm_lower)"
+    mark_done resolver
+}
+
+# ---------------------------------------------------------------------------
+# domain
+# ---------------------------------------------------------------------------
+stop_samba_services() {
+    systemctl stop samba-ad-dc smbd nmbd winbind >/dev/null 2>&1 || true
+}
+
+wait_for_peer() {
+    local peer="$1" i
+    log "waiting for ${peer}:389 (LDAP) for up to ${AD_WAIT}s"
+    for ((i = 0; i < AD_WAIT; i += 5)); do
+        if timeout 4 bash -c "exec 3<>/dev/tcp/${peer}/389" 2>/dev/null; then return 0; fi
+        sleep 5
+    done
+    return 1
+}
+
+configure_smb_extras() {
+    # samba-tool writes a minimal smb.conf; add what a DC in this setup needs.
+    local iface conf=/etc/samba/smb.conf
+    iface="$(primary_iface)"
+    grep -q 'adc-maas' "$conf" 2>/dev/null && return 0
+
+    python3 - "$conf" "$iface" "$AD_DNS_FORWARDER" <<'PY'
+import sys
+path, iface, forwarder = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(path).read().splitlines()
+out, injected = [], False
+for line in lines:
+    out.append(line)
+    if not injected and line.strip().lower() == "[global]":
+        out.append("\t# --- adc-maas ---")
+        if forwarder:
+            out.append("\tdns forwarder = %s" % forwarder)
+        if iface:
+            out.append("\tinterfaces = lo %s" % iface)
+            out.append("\tbind interfaces only = yes")
+        # Windows clients still negotiate SMB2 at minimum; refuse SMB1 outright.
+        out.append("\tserver min protocol = SMB2_10")
+        out.append("\t# --- end adc-maas ---")
+        injected = True
+open(path, "w").write("\n".join(out) + "\n")
+PY
+}
+
+link_krb5_conf() {
+    if [ -f /var/lib/samba/private/krb5.conf ]; then
+        cp -a /etc/krb5.conf "$STATE_DIR/krb5.conf.orig" 2>/dev/null || true
+        ln -sf /var/lib/samba/private/krb5.conf /etc/krb5.conf
+    fi
+}
+
+stage_domain() {
+    is_done domain && return 0
+    [ "$AD_MODE" = "none" ] && { log "AD_MODE=none, nothing to do"; mark_done domain; return 0; }
+
+    local pw; pw="$(admin_password)"
+    [ -n "$AD_REALM" ] || { warn "AD_REALM is required"; return 1; }
+    [ -n "$AD_DOMAIN" ] || { warn "AD_DOMAIN (NetBIOS name) is required"; return 1; }
+    [ -n "$pw" ] || { warn "AD_ADMIN_PASSWORD is required"; return 1; }
+
+    if [ -f /var/lib/samba/private/sam.ldb ]; then
+        log "this host already holds a domain database, skipping"
+        mark_done domain
+        return 0
+    fi
+
+    stop_samba_services
+    rm -f /etc/samba/smb.conf
+
+    local -a rfc=()
+    [ "$AD_USE_RFC2307" = "true" ] && rfc=(--use-rfc2307)
+
+    case "$AD_MODE" in
+    provision)
+        log "provisioning a new domain: realm=${AD_REALM} netbios=${AD_DOMAIN}"
+        if ! samba-tool domain provision \
+                --realm="$AD_REALM" \
+                --domain="$AD_DOMAIN" \
+                --server-role=dc \
+                --dns-backend="$AD_DNS_BACKEND" \
+                --function-level="$AD_FUNCTION_LEVEL" \
+                --adminpass="$pw" \
+                "${rfc[@]}"; then
+            warn "samba-tool domain provision failed"
+            warn "a common cause is AD_ADMIN_PASSWORD not meeting complexity rules"
+            return 1
+        fi
+        ;;
+    join)
+        local peer="$AD_JOIN_PEER"
+        if [ -n "$peer" ]; then
+            wait_for_peer "$peer" || { warn "${peer} did not answer on 389"; return 1; }
+        else
+            warn "AD_JOIN_PEER unset — relying on DNS to locate a DC"
+        fi
+        local i rc=1
+        for ((i = 1; i <= AD_RETRIES; i++)); do
+            log "joining ${AD_REALM} as a domain controller (attempt ${i}/${AD_RETRIES})"
+            if samba-tool domain join "$AD_REALM" DC \
+                    -U"${AD_DOMAIN}\\${AD_JOIN_USER}" \
+                    --password="$pw" \
+                    --dns-backend="$AD_DNS_BACKEND" \
+                    --site="$AD_SITE"; then
+                rc=0; break
+            fi
+            warn "join failed, retrying in 30s"
+            sleep 30
+        done
+        [ "$rc" -eq 0 ] || { warn "join failed after ${AD_RETRIES} attempts"; return 1; }
+        ;;
+    *)
+        warn "invalid AD_MODE=${AD_MODE}"
+        mark_done domain
+        return 0
+        ;;
+    esac
+
+    configure_smb_extras
+    link_krb5_conf
+    mark_done domain
+}
+
+# ---------------------------------------------------------------------------
+# services — Debian ships the standalone file-server daemons enabled; a DC runs
+# a single samba daemon instead, and the two sets conflict.
+# ---------------------------------------------------------------------------
+stage_services() {
+    is_done services && return 0
+    [ -f /var/lib/samba/private/sam.ldb ] || { mark_done services; return 0; }
+
+    log "switching to the samba-ad-dc daemon"
+    systemctl disable --now smbd nmbd winbind >/dev/null 2>&1 || true
+    systemctl mask smbd nmbd winbind >/dev/null 2>&1 || true
+    systemctl unmask samba-ad-dc >/dev/null 2>&1 || true
+    systemctl enable --now samba-ad-dc >/dev/null 2>&1 || {
+        warn "samba-ad-dc did not start"; return 1; }
+
+    # A DC serves its own domain's DNS; point the resolver at it now.
+    write_resolv 127.0.0.1 "$(realm_lower)"
+    mark_done services
+}
+
+# ---------------------------------------------------------------------------
+# sysvol — Samba implements neither DFS-R nor FRS, so SYSVOL (where Group
+# Policy lives) does not replicate between DCs on its own.
+# ---------------------------------------------------------------------------
+stage_sysvol() {
+    is_done sysvol && return 0
+    [ -f /var/lib/samba/private/sam.ldb ] || { mark_done sysvol; return 0; }
+
+    local source="${AD_SYSVOL_SOURCE:-$AD_JOIN_PEER}"
+    local want="$AD_SYSVOL_SYNC"
+    [ "$want" = "auto" ] && { [ "$AD_MODE" = "join" ] && want=on || want=off; }
+
+    if [ "$want" != "on" ]; then
+        log "SYSVOL replication not enabled on this host"
+        [ "$AD_MODE" = "provision" ] && \
+            log "this DC is the replication source; additional DCs pull from it"
+        mark_done sysvol
+        return 0
+    fi
+    if [ -z "$source" ]; then
+        warn "AD_SYSVOL_SOURCE unset and no join peer — SYSVOL will not replicate"
+        warn "Group Policy changes made on other DCs will not appear here"
+        mark_done sysvol
+        return 0
+    fi
+
+    log "enabling SYSVOL replication from ${source} every ${AD_SYSVOL_INTERVAL}"
+    cat > /etc/adc-maas/sysvol-sync.conf <<EOF
+# Managed by adc-maas-init.
+SYSVOL_SOURCE=${source}
+EOF
+    sed -i "s|^OnUnitActiveSec=.*|OnUnitActiveSec=${AD_SYSVOL_INTERVAL}|" \
+        /etc/systemd/system/adc-sysvol-sync.timer 2>/dev/null || true
+    systemctl daemon-reload
+    systemctl enable --now adc-sysvol-sync.timer >/dev/null 2>&1 \
+        || warn "could not enable adc-sysvol-sync.timer"
+    mark_done sysvol
+}
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+stage_selftest() {
+    is_done selftest && return 0
+    [ -f /var/lib/samba/private/sam.ldb ] || { mark_done selftest; return 0; }
+
+    local ok=0 pw; pw="$(admin_password)"
+
+    if samba-tool domain level show >/dev/null 2>&1; then
+        log "domain level: $(samba-tool domain level show 2>/dev/null | tr '\n' ' ')"
+    else
+        warn "samba-tool domain level show failed"; ok=1
+    fi
+
+    if command -v smbclient >/dev/null 2>&1; then
+        if smbclient -L localhost -N >/dev/null 2>&1; then
+            log "SMB responds; SYSVOL and NETLOGON should be listed"
+        else
+            warn "smbclient could not list shares"; ok=1
+        fi
+    fi
+
+    if [ -n "$pw" ] && command -v kinit >/dev/null 2>&1; then
+        if printf '%s' "$pw" | kinit "Administrator@${AD_REALM}" >/dev/null 2>&1; then
+            log "Kerberos: got a ticket for Administrator@${AD_REALM}"
+            kdestroy >/dev/null 2>&1 || true
+        else
+            warn "kinit failed — check the clock and the DNS records"; ok=1
+        fi
+    fi
+
+    [ "$ok" -eq 0 ] || warn "self-test reported problems; see the messages above"
+    mark_done selftest
+}
+
+wipe_secrets() {
+    [ "$AD_WIPE_SECRETS" = "true" ] || return 0
+    local f
+    for f in "$CONF_DIR"/conf.d/*.conf; do
+        [ -r "$f" ] || continue
+        grep -q 'AD_ADMIN_PASSWORD' "$f" || continue
+        log "scrubbing credentials from $f"
+        sed -i -E "s/^([[:space:]]*AD_ADMIN_PASSWORD=).*/\1'<removed>'/" "$f"
+    done
+    if [ -n "$AD_ADMIN_PASSWORD_FILE" ] && [ -f "$AD_ADMIN_PASSWORD_FILE" ]; then
+        shred -u "$AD_ADMIN_PASSWORD_FILE" 2>/dev/null || rm -f "$AD_ADMIN_PASSWORD_FILE"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+main() {
+    load_config
+    [ "$AD_ENABLED" = "true" ] || { log "AD_ENABLED=false, doing nothing"; exit 0; }
+
+    log "starting (hostname=$(hostname -s))"
+    wait_for_cloud_init
+    load_config            # cloud-init may have just written conf.d
+
+    if ! wait_for_network; then
+        warn "no management address; will retry on the next boot"
+        exit 1
+    fi
+
+    local failed=0
+    stage_hosts    || failed=1
+    stage_identity || failed=1
+    stage_time     || failed=1
+    stage_resolver || failed=1
+    stage_domain   || failed=1
+    stage_services || failed=1
+    stage_sysvol   || failed=1
+    stage_selftest || failed=1
+
+    if [ "$failed" -eq 0 ] \
+        && is_done hosts && is_done identity && is_done time && is_done resolver \
+        && is_done domain && is_done services && is_done sysvol && is_done selftest; then
+        wipe_secrets
+        date -Is > "$STATE_DIR/complete"
+        log "all stages complete"
+    else
+        warn "some stages did not complete; the service retries on the next boot"
+        warn "details: journalctl -u adc-maas-init"
+        exit 1
+    fi
+}
+
+main "$@"

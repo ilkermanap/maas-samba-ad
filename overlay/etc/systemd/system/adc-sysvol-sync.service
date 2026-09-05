@@ -1,0 +1,12 @@
+# Copyright (C) 2026 Ilker Manap
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=Replicate SYSVOL from another domain controller
+Documentation=https://wiki.samba.org/index.php/SysVol_replication_(DFS-R)
+After=samba-ad-dc.service
+Requires=samba-ad-dc.service
+ConditionPathExists=/etc/adc-maas/sysvol-sync.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/adc-sysvol-sync

@@ -1,0 +1,247 @@
+#!/bin/bash
+# Copyright (C) 2026 Ilker Manap
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# customize-samba-ad.sh - runs inside the packer-maas build VM.
+#
+# Installs everything a Samba Active Directory domain controller needs on top of
+# the Debian cloud image, then removes every trace of domain state so the image
+# is generic. The domain itself is created or joined on first boot by
+# adc-maas-init, driven by the cloud-init user-data MAAS supplies.
+#
+# This file is a template; the Makefile fills in the @@...@@ placeholders and
+# appends the overlay archive, base64 encoded, after the marker at the end.
+#
+# Packer runs this with expect_disconnect = true.
+set -euo pipefail
+
+DEBIAN_SUITE="@@DEBIAN_SERIES@@"
+AD_EXTRA_PACKAGES="@@AD_EXTRA_PACKAGES@@"
+PACKER_MAAS_REF="@@PM_REF@@"
+
+export DEBIAN_FRONTEND=noninteractive
+APT="apt-get -y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef"
+
+use_eatmydata() {
+    command -v eatmydata >/dev/null 2>&1 || return 0
+    APT="eatmydata ${APT}"
+    log "eatmydata enabled (dpkg fsync calls disabled)"
+}
+
+log() { echo "==> [ad-image] $*"; }
+
+# ---------------------------------------------------------------------------
+# 1. Unpack the overlay embedded at the end of this script
+# ---------------------------------------------------------------------------
+log "unpacking the overlay"
+sed -n '/^__ADC_MAAS_OVERLAY__$/,$p' "$0" | tail -n +2 | base64 -d \
+    | tar xzf - -C / --no-same-owner --no-same-permissions
+chown -R root:root /usr/local/sbin/adc-maas-init /usr/local/sbin/adc-sysvol-sync \
+                   /etc/adc-maas /etc/systemd/system/adc-maas-init.service \
+                   /etc/systemd/system/adc-sysvol-sync.service \
+                   /etc/systemd/system/adc-sysvol-sync.timer /curtin
+chmod 0755 /usr/local/sbin/adc-maas-init /usr/local/sbin/adc-sysvol-sync
+chmod 0755 /curtin /curtin/curtin-hooks
+chmod 0644 /etc/adc-maas/adc-maas.conf
+mkdir -p /etc/adc-maas/conf.d /var/lib/adc-maas
+
+# ---------------------------------------------------------------------------
+# 2. The build hostname has to resolve while packages configure themselves
+# ---------------------------------------------------------------------------
+BUILD_HOST="$(hostname -s)"
+BUILD_IP="$(ip -4 -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)"
+: "${BUILD_IP:=127.0.1.1}"
+log "build hostname=${BUILD_HOST} ip=${BUILD_IP}"
+cp -a /etc/hosts /etc/hosts.ad-image-backup
+sed -i "/[[:space:]]${BUILD_HOST}\([[:space:]]\|$\)/d" /etc/hosts
+echo "${BUILD_IP} ${BUILD_HOST}.local ${BUILD_HOST}" >> /etc/hosts
+hostname -f || echo "WARNING: hostname -f does not resolve" >&2
+
+# ---------------------------------------------------------------------------
+# 3. Keep the MAAS-compatible cloud-init packer-maas installed
+# ---------------------------------------------------------------------------
+log "holding the cloud-init package"
+apt-mark hold cloud-init || true
+
+apt-get update
+$APT install eatmydata || true
+use_eatmydata
+
+log "full-upgrade"
+$APT full-upgrade
+
+# ---------------------------------------------------------------------------
+# 4. Answer the questions the packages would otherwise ask
+# ---------------------------------------------------------------------------
+# samba-common would offer to take WINS settings from DHCP, which is wrong for
+# a DC. krb5-config wants a realm; the real one is not known until first boot,
+# and adc-maas-init replaces /etc/krb5.conf with Samba's own anyway.
+debconf-set-selections <<EOF
+samba-common samba-common/dhcp boolean false
+samba-common samba-common/do_debconf boolean false
+krb5-config krb5-config/default_realm string EXAMPLE.LAN
+krb5-config krb5-config/add_servers_realm string EXAMPLE.LAN
+krb5-config krb5-config/read_conf boolean true
+EOF
+
+# ---------------------------------------------------------------------------
+# 5. Defer initramfs regeneration until the end
+# ---------------------------------------------------------------------------
+log "diverting update-initramfs for the duration of the install"
+dpkg-divert --local --rename --add /usr/sbin/update-initramfs >/dev/null
+ln -sf /bin/true /usr/sbin/update-initramfs
+
+# ---------------------------------------------------------------------------
+# 6. The domain controller itself
+#
+# What an Active Directory domain actually consists of, all of it served by the
+# single samba daemon unless noted:
+#
+#   LDAP      the directory: users, groups, computers, policy links
+#   Kerberos  the KDC that issues the tickets clients authenticate with
+#   DNS       AD is unusable without it — clients find DCs through SRV records
+#   SMB       the SYSVOL and NETLOGON shares, where Group Policy lives
+#   NTP       chrony; Kerberos rejects a clock skew over five minutes
+# ---------------------------------------------------------------------------
+log "installing the Samba AD domain controller"
+$APT install \
+    samba samba-ad-dc samba-ad-provision samba-dsdb-modules \
+    winbind libnss-winbind libpam-winbind \
+    smbclient ldb-tools \
+    krb5-user \
+    chrony \
+    rsync
+
+if [ -n "${AD_EXTRA_PACKAGES}" ]; then
+    log "installing extra packages: ${AD_EXTRA_PACKAGES}"
+    # shellcheck disable=SC2086
+    $APT install ${AD_EXTRA_PACKAGES}
+fi
+
+log "installed versions:"
+dpkg-query -W -f='${Package} ${Version}\n' samba samba-ad-dc winbind krb5-user chrony || true
+
+# Confirm this Samba can actually be a DC. Debian builds Samba against its
+# bundled Heimdal; a build against system MIT Kerberos would make the AD DC role
+# experimental, and samba-ad-dc would then pull in krb5-kdc.
+if dpkg-query -W -f='${Depends}' samba-ad-dc 2>/dev/null | grep -q 'krb5-kdc'; then
+    echo "ERROR: this samba-ad-dc depends on the MIT KDC; the AD DC role is" >&2
+    echo "       experimental in that configuration and is not used here." >&2
+    exit 1
+fi
+log "samba-ad-dc uses the bundled Heimdal KDC (the supported configuration)"
+
+# ---------------------------------------------------------------------------
+# 6b. Swap the cloud kernel for the generic one
+#
+# The Debian cloud image ships linux-image-cloud-amd64, which is built for
+# virtual machines and leaves out most physical-hardware drivers. This image is
+# deployed to bare metal by MAAS, so it needs the generic kernel or the node may
+# come up with no disk or no network. curtin does not install a kernel here
+# (see /curtin/curtin-hooks), so whatever is in the image is what boots.
+# ---------------------------------------------------------------------------
+DEB_ARCH="$(dpkg --print-architecture)"
+log "installing the generic kernel (linux-image-${DEB_ARCH})"
+$APT install "linux-image-${DEB_ARCH}"
+
+CLOUD_KERNELS="$(dpkg-query -W -f='${Package}\n' 'linux-image-*cloud*' 2>/dev/null | grep -E '^linux-image' || true)"
+if [ -n "${CLOUD_KERNELS}" ]; then
+    log "removing the cloud-only kernel: ${CLOUD_KERNELS}"
+    # shellcheck disable=SC2086
+    $APT purge ${CLOUD_KERNELS} || true
+fi
+$APT autoremove --purge || true
+
+log "restoring update-initramfs and running it once"
+rm -f /usr/sbin/update-initramfs
+dpkg-divert --local --rename --remove /usr/sbin/update-initramfs >/dev/null
+update-initramfs -u -k all
+update-grub
+
+# ---------------------------------------------------------------------------
+# 7. Remove every trace of a domain
+#
+# Installing the packages leaves a default smb.conf and can leave TDB state. If
+# any of it shipped in the image, every machine deployed from it would start
+# from the same half-configured directory, and `samba-tool domain provision`
+# would refuse to run at all.
+# ---------------------------------------------------------------------------
+log "clearing domain state so the image is generic"
+systemctl stop samba-ad-dc smbd nmbd winbind 2>/dev/null || true
+rm -f  /etc/samba/smb.conf
+rm -rf /var/lib/samba/private/* /var/lib/samba/sysvol/*
+find /var/lib/samba -maxdepth 1 -name '*.tdb' -delete 2>/dev/null || true
+find /var/cache/samba -type f -delete 2>/dev/null || true
+rm -f /etc/krb5.keytab
+
+# The standalone file-server daemons conflict with the AD DC daemon. Mask them
+# now; adc-maas-init unmasks and starts samba-ad-dc once a domain exists.
+systemctl disable smbd nmbd winbind 2>/dev/null || true
+systemctl mask smbd nmbd winbind 2>/dev/null || true
+systemctl disable samba-ad-dc 2>/dev/null || true
+
+# Node-unique, must not be shared between machines built from this image.
+rm -f /etc/iscsi/initiatorname.iscsi
+rm -f /root/.ssh/known_hosts /etc/ssh/ssh_known_hosts
+
+# ---------------------------------------------------------------------------
+# 8. Leave the network to MAAS on the first boot
+#
+# ifupdown/ifupdown2 writes the build VM's interface name into
+# /etc/network/interfaces. On a deployed node MAAS configures the network
+# through netplan and systemd-networkd; if ifupdown also starts, it takes the
+# real interface down using that stale definition and the node loses its network
+# before any of our automation runs.
+# ---------------------------------------------------------------------------
+log "disabling networking.service (MAAS owns the network on first boot)"
+cat > /etc/network/interfaces <<'EOF'
+# Left deliberately minimal. The network on a deployed node is configured by
+# MAAS through netplan and systemd-networkd.
+auto lo
+iface lo inet loopback
+
+source /etc/network/interfaces.d/*
+EOF
+rm -f /etc/network/interfaces.d/* /etc/network/interfaces.new 2>/dev/null || true
+systemctl disable networking.service 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 9. First-boot service, persistent logs, image metadata
+# ---------------------------------------------------------------------------
+log "enabling adc-maas-init.service"
+systemctl daemon-reload
+systemctl enable adc-maas-init.service
+
+# The first boot can reboot once, and a volatile journal loses everything that
+# happened before it — including why a stage failed.
+log "enabling a persistent journal"
+mkdir -p /var/log/journal
+systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
+
+log "writing /etc/adc-maas/image-info"
+{
+    echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "debian_suite=${DEBIAN_SUITE}"
+    echo "packer_maas_ref=${PACKER_MAAS_REF}"
+    dpkg-query -W -f='${Package}=${Version}\n' samba samba-ad-dc winbind krb5-user 2>/dev/null
+    echo "kernel=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | head -1)"
+} > /etc/adc-maas/image-info
+cat /etc/adc-maas/image-info
+
+# ---------------------------------------------------------------------------
+# 10. Clean up
+# ---------------------------------------------------------------------------
+log "cleaning up"
+mv /etc/hosts.ad-image-backup /etc/hosts
+$APT clean
+rm -rf /var/lib/apt/lists/*
+find /var/log/journal -mindepth 1 -delete 2>/dev/null || true
+rm -rf /var/log/*.gz /var/log/*.1
+: > /var/log/wtmp || true
+: > /var/log/btmp || true
+cloud-init clean --logs || true
+
+log "image ready: Samba AD DC on Debian ${DEBIAN_SUITE}"
+exit 0
+
+# Everything after this marker is the base64 overlay archive the Makefile appends.

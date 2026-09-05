@@ -1,0 +1,28 @@
+# Copyright (C) 2026 Ilker Manap
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=Samba AD domain controller post-deployment configuration for MAAS
+Documentation=file:/etc/adc-maas/adc-maas.conf
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/adc-maas/complete
+
+# Do NOT order this after cloud-init here.
+#
+# After=cloud-final.service together with WantedBy=multi-user.target forms an
+# ordering cycle on this image, and systemd breaks it by deleting THIS unit's
+# start job — the service then never runs and reports no error. The script waits
+# for cloud-init itself instead.
+
+[Service]
+# Type=simple, not oneshot: a oneshot unit blocks multi-user.target, which
+# cloud-final.service is ordered after, so waiting for cloud-init inside the
+# script would deadlock. Stage tracking uses /var/lib/adc-maas/*.done anyway.
+Type=simple
+ExecStart=/usr/local/sbin/adc-maas-init
+TimeoutStartSec=0
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

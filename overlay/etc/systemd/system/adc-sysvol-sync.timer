@@ -1,0 +1,14 @@
+# Copyright (C) 2026 Ilker Manap
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=Replicate SYSVOL periodically
+Documentation=https://wiki.samba.org/index.php/SysVol_replication_(DFS-R)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=adc-sysvol-sync.service
+
+[Install]
+WantedBy=timers.target

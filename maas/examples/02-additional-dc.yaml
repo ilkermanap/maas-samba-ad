@@ -1,0 +1,55 @@
+#cloud-config
+# Copyright (C) 2026 Ilker Manap
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# An ADDITIONAL domain controller: joins the existing domain.
+#
+# This is what gives the domain redundancy. Two DCs mean logons survive losing
+# one of them; point clients at both as DNS servers.
+
+write_files:
+  - path: /etc/adc-maas/conf.d/50-ad.conf
+    permissions: "0600"
+    owner: root:root
+    content: |
+      AD_MODE=join
+      AD_REALM=AD.EXAMPLE.COM
+      AD_DOMAIN=EXAMPLE
+
+      # An existing DC, by IP. Needed because this host cannot resolve the
+      # domain until it points its resolver at a DC that already serves it.
+      AD_JOIN_PEER=192.0.2.10
+
+      # Credentials of a Domain Admin on that DC.
+      AD_JOIN_USER=Administrator
+      AD_ADMIN_PASSWORD='CHANGE-ME-Str0ng!'
+
+      AD_DNS_FORWARDER=192.0.2.1
+      AD_NTP_ALLOW=192.0.2.0/24
+
+      # SYSVOL — where Group Policy lives — does not replicate by itself:
+      # Samba implements neither DFS-R nor FRS. This pulls it from the first DC
+      # over rsync and reapplies the ACLs afterwards.
+      #
+      # It needs a root SSH key here that is authorised on AD_SYSVOL_SOURCE.
+      # Without one the sync exits with an explanation instead of silently
+      # letting Group Policy diverge between DCs.
+      AD_SYSVOL_SYNC=on
+      AD_SYSVOL_SOURCE=192.0.2.10
+      AD_SYSVOL_INTERVAL=5min
+
+  # The private key the SYSVOL sync uses to reach the source DC. Its public
+  # half must be in /root/.ssh/authorized_keys on that DC.
+  #
+  # This puts a private key into MAAS user-data, where anyone with MAAS access
+  # can read it. Use a key generated for this purpose only, authorised for
+  # nothing else. If that is not acceptable, leave this out and set up SYSVOL
+  # replication by hand after deployment - the sync script says exactly what it
+  # needs and refuses to pretend it is working.
+  - path: /root/.ssh/id_ed25519
+    permissions: "0600"
+    owner: root:root
+    content: |
+      -----BEGIN OPENSSH PRIVATE KEY-----
+      REPLACE-WITH-A-KEY-DEDICATED-TO-SYSVOL-REPLICATION
+      -----END OPENSSH PRIVATE KEY-----

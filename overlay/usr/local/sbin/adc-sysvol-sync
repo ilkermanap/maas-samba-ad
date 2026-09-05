@@ -1,0 +1,72 @@
+#!/bin/bash
+# Copyright (C) 2026 Ilker Manap
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# adc-sysvol-sync - pulls SYSVOL from another domain controller.
+#
+# Samba implements neither DFS-R nor FRS, so the SYSVOL share — which holds
+# Group Policy objects and logon scripts — does not replicate between domain
+# controllers by itself. Without something like this, a policy created on one DC
+# is invisible to clients that authenticate against another, and the domain
+# silently behaves differently depending on which DC a client happened to reach.
+#
+# This is the rsync approach from the Samba wiki: pull from the DC holding the
+# PDC Emulator FSMO role, then reset the POSIX ACLs from what is stored in AD.
+#
+# Configuration: /etc/adc-maas/sysvol-sync.conf   (SYSVOL_SOURCE=<dc fqdn or ip>)
+# Authentication: root SSH key to the source DC. Provide one at deploy time;
+# without it this exits with a clear message rather than failing silently.
+set -uo pipefail
+
+CONF=/etc/adc-maas/sysvol-sync.conf
+SYSVOL=/var/lib/samba/sysvol
+LOG_TAG=adc-sysvol-sync
+
+log()  { echo "[$LOG_TAG] $*"; logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true; }
+warn() { echo "[$LOG_TAG] WARN: $*" >&2; logger -t "$LOG_TAG" -p user.warning -- "$*" 2>/dev/null || true; }
+
+[ -r "$CONF" ] || { log "no $CONF, nothing to do"; exit 0; }
+# shellcheck disable=SC1090
+. "$CONF"
+: "${SYSVOL_SOURCE:?SYSVOL_SOURCE not set in $CONF}"
+
+[ -d "$SYSVOL" ] || { warn "$SYSVOL missing — is this host a DC?"; exit 1; }
+
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+if ! ssh $SSH_OPTS "root@${SYSVOL_SOURCE}" true 2>/dev/null; then
+    warn "cannot reach root@${SYSVOL_SOURCE} over SSH — SYSVOL is NOT replicating"
+    warn "install a root SSH key on this host that is authorised on ${SYSVOL_SOURCE},"
+    warn "or replicate SYSVOL by some other means. Group Policy will diverge until then."
+    exit 1
+fi
+
+# idmap.ldb decides which POSIX uid/gid each SID maps to. If it differs between
+# DCs, the same file shows different ownership depending on which DC serves it.
+# The Samba wiki calls syncing it a prerequisite, not an optimisation.
+if [ ! -e /var/lib/adc-maas/idmap-synced ]; then
+    log "syncing idmap.ldb from ${SYSVOL_SOURCE} (one time)"
+    if rsync -a -e "ssh $SSH_OPTS" \
+            "root@${SYSVOL_SOURCE}:/var/lib/samba/private/idmap.ldb" \
+            /var/lib/samba/private/idmap.ldb; then
+        mkdir -p /var/lib/adc-maas && date -Is > /var/lib/adc-maas/idmap-synced
+        systemctl restart samba-ad-dc >/dev/null 2>&1 || true
+    else
+        warn "idmap.ldb sync failed; uid/gid mappings may differ between DCs"
+    fi
+fi
+
+log "pulling SYSVOL from ${SYSVOL_SOURCE}"
+if rsync -aAX --delete -e "ssh $SSH_OPTS" \
+        "root@${SYSVOL_SOURCE}:${SYSVOL}/" "${SYSVOL}/"; then
+    # rsync carries POSIX bits; the Windows ACLs come from AD and have to be
+    # reapplied afterwards or clients get access-denied on Group Policy.
+    if samba-tool ntacl sysvolreset >/dev/null 2>&1; then
+        log "SYSVOL synced and ACLs reset"
+    else
+        warn "sysvolreset failed — clients may be denied access to Group Policy"
+        exit 1
+    fi
+else
+    warn "rsync failed"
+    exit 1
+fi

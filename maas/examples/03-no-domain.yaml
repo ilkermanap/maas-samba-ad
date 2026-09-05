@@ -1,0 +1,13 @@
+#cloud-config
+# Copyright (C) 2026 Ilker Manap
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Deploy the image without touching any domain — useful for staging a machine
+# now and provisioning or joining later by hand.
+
+write_files:
+  - path: /etc/adc-maas/conf.d/50-ad.conf
+    permissions: "0600"
+    owner: root:root
+    content: |
+      AD_MODE=none

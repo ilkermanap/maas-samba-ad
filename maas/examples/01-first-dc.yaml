@@ -1,0 +1,40 @@
+#cloud-config
+# Copyright (C) 2026 Ilker Manap
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# The FIRST domain controller: creates the domain.
+#
+# In Active Directory this is not a "primary" DC in the NT 4 sense — every DC is
+# an equal, writable peer. This one simply happens to run the provisioning step,
+# and it starts out holding the five FSMO roles.
+#
+#   maas $PROFILE machine deploy $SYSTEM_ID \
+#     osystem=custom distro_series=samba-ad-dc \
+#     user_data="$(base64 -w0 01-first-dc.yaml)"
+
+write_files:
+  - path: /etc/adc-maas/conf.d/50-ad.conf
+    permissions: "0600"
+    owner: root:root
+    content: |
+      AD_MODE=provision
+
+      # Kerberos realm: your DNS domain in UPPERCASE. Use something you control
+      # and that is not your public web domain. Never a bare ".local".
+      AD_REALM=AD.EXAMPLE.COM
+
+      # NetBIOS name: uppercase, at most 15 characters, no dots.
+      AD_DOMAIN=EXAMPLE
+
+      # Becomes the domain Administrator password. Active Directory enforces
+      # complexity: 7+ characters, three of upper/lower/digit/symbol. A weak one
+      # makes provisioning fail with an unhelpful error.
+      AD_ADMIN_PASSWORD='CHANGE-ME-Str0ng!'
+
+      # Where the DC forwards queries it is not authoritative for. Without this
+      # the DC resolves your domain and nothing else.
+      AD_DNS_FORWARDER=192.0.2.1
+
+      # Subnet allowed to use this DC as a time source. Domain members need
+      # working time — Kerberos rejects a skew over five minutes.
+      AD_NTP_ALLOW=192.0.2.0/24
