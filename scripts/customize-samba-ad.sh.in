@@ -237,7 +237,12 @@ log "writing /etc/adc-maas/image-info"
     echo "debian_suite=${DEBIAN_SUITE}"
     echo "packer_maas_ref=${PACKER_MAAS_REF}"
     dpkg-query -W -f='${Package}=${Version}\n' samba samba-ad-dc winbind krb5-user 2>/dev/null
-    echo "kernel=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | head -1)"
+    kabi=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | head -1)
+    echo "kernel=${kabi}"
+    # The line above is the ABI string, which is a package-name suffix and only
+    # changes on an ABI bump. CI needs something it can actually compare against
+    # the archive, so record the kernel package version as well.
+    echo "kernel_version=$(dpkg-query -W -f='${Version}' "linux-image-${kabi}" 2>/dev/null || echo unknown)"
 } > /etc/adc-maas/image-info
 cat /etc/adc-maas/image-info
 
